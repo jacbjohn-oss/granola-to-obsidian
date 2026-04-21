@@ -27,8 +27,8 @@ from typing import Dict, List, Optional, Tuple
 import httpx
 
 # ── Paths ──────────────────────────────────────────────────────────────────
-OBSIDIAN_CLASSES  = Path.home() / "Documents/Obsidian Vault/Classes"
-OBSIDIAN_MEETINGS = Path.home() / "Documents/Obsidian Vault/Meetings"
+OBSIDIAN_CLASSES  = Path.home() / "Library/Mobile Documents/iCloud~md~obsidian/Documents/Obsidian Vault/Classes"
+OBSIDIAN_MEETINGS = Path.home() / "Library/Mobile Documents/iCloud~md~obsidian/Documents/Obsidian Vault/Meetings"
 GRANOLA_AUTH_PATH = Path.home() / "Library/Application Support/Granola/supabase.json"
 ENV_PATH          = Path(__file__).parent / ".env"
 
