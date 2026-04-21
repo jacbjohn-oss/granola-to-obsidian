@@ -30,7 +30,7 @@ import httpx
 OBSIDIAN_CLASSES  = Path.home() / "Documents/Obsidian Vault/Classes"
 OBSIDIAN_MEETINGS = Path.home() / "Documents/Obsidian Vault/Meetings"
 GRANOLA_AUTH_PATH = Path.home() / "Library/Application Support/Granola/supabase.json"
-ENV_PATH          = Path(__file__).parent / "canvas-mcp/.env"
+ENV_PATH          = Path(__file__).parent / ".env"
 
 GRANOLA_API = "https://api.granola.ai"
 CANVAS_BASE = "https://canvas.stanford.edu/api/v1"
@@ -71,6 +71,79 @@ def get_canvas_token() -> str:
         if line.startswith("CANVAS_API_TOKEN="):
             return line.split("=", 1)[1].strip()
     raise ValueError("CANVAS_API_TOKEN not found in .env")
+
+
+def get_anthropic_key() -> Optional[str]:
+    """Returns Anthropic API key if configured, else None (enrichment is optional)."""
+    if os.getenv("ANTHROPIC_API_KEY"):
+        return os.getenv("ANTHROPIC_API_KEY")
+    try:
+        for line in ENV_PATH.read_text().splitlines():
+            if line.startswith("ANTHROPIC_API_KEY="):
+                return line.split("=", 1)[1].strip()
+    except Exception:
+        pass
+    return None
+
+
+# ── Note enrichment ────────────────────────────────────────────────────────
+
+_ENRICH_PROMPT = """\
+You are enriching class notes from {course} at Stanford GSB. The student recorded \
+these notes in class. Your job is to add depth without changing the original content.
+
+RAW NOTES:
+{notes}
+
+Add a concise analysis in this exact markdown format (no intro, no commentary, \
+just the three sections):
+
+### Analysis
+
+**Key Frameworks:**
+- [1-2 established frameworks/mental models that organize the main concepts — \
+name the framework, then one sentence on how it applies here]
+
+**Big Takeaways:**
+- [3-5 bullet points — the most important, actionable, or exam-worthy insights \
+from this session, phrased as sharp principles not summaries]
+
+**Outside Connections:**
+- [1-2 connections to books, theories, real companies, or concepts from other \
+courses that deepen understanding — be specific, not generic]
+"""
+
+ANTHROPIC_API = "https://api.anthropic.com/v1/messages"
+
+
+async def enrich_notes(ai_md: str, course_name: str, api_key: str) -> str:
+    """
+    Calls Claude to add frameworks, takeaways, and outside connections.
+    Returns the Analysis block markdown, or "" on failure.
+    """
+    if not ai_md or not ai_md.strip():
+        return ""
+    prompt = _ENRICH_PROMPT.format(course=course_name, notes=ai_md)
+    try:
+        async with httpx.AsyncClient(timeout=45) as client:
+            r = await client.post(
+                ANTHROPIC_API,
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-haiku-4-5",
+                    "max_tokens": 600,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+            )
+            if r.is_success:
+                return r.json()["content"][0]["text"].strip()
+    except Exception as e:
+        print(f"  [enrichment failed: {e}]")
+    return ""
 
 
 # ── Class matching ─────────────────────────────────────────────────────────
@@ -414,7 +487,8 @@ def attendee_tags(names: List[str], my_name: str = "Jacob Johnson") -> List[str]
 
 
 def write_meeting_file(doc: dict, ai_md: str, private_md: str,
-                       folder_name: str, today: date) -> Tuple[bool, str]:
+                       folder_name: str, today: date,
+                       analysis: str = "") -> Tuple[bool, str]:
     """
     Write/update a standalone meeting file: Meetings/[folder]/YYYY-MM-DD - Title.md
 
@@ -471,6 +545,8 @@ def write_meeting_file(doc: dict, ai_md: str, private_md: str,
             body.append(f"**With:** {', '.join(others)}")
         if ai_md:
             body += [f"\n## Notes\n{ai_md}"]
+        if analysis:
+            body += [f"\n{analysis}"]
 
         my_notes = preserve_notes if preserve_notes is not None else "*(none)*"
         body += [f"\n---\n{_MY_NOTES_MARKER}\n\n{my_notes}\n\n---"]
@@ -568,7 +644,8 @@ async def fetch_canvas_context(token: str, class_name: str, today: date) -> dict
 
 _MY_NOTES_MARKER = "### My Notes"
 
-def build_ai_block(doc: dict, ai_md: str, context: dict, today: date) -> str:
+def build_ai_block(doc: dict, ai_md: str, context: dict, today: date,
+                   analysis: str = "") -> str:
     """
     The refreshable part of an entry — everything above the My Notes marker.
     Stored updated_at so we can detect Granola edits later.
@@ -596,12 +673,16 @@ def build_ai_block(doc: dict, ai_md: str, context: dict, today: date) -> str:
     if ai_md:
         lines += ["", ai_md]
 
+    if analysis:
+        lines += ["", analysis]
+
     return "\n".join(lines)
 
 
-def build_entry(doc: dict, ai_md: str, context: dict, today: date) -> str:
+def build_entry(doc: dict, ai_md: str, context: dict, today: date,
+                analysis: str = "") -> str:
     """Full entry = AI block + protected My Notes section."""
-    ai_block = build_ai_block(doc, ai_md, context, today)
+    ai_block = build_ai_block(doc, ai_md, context, today, analysis=analysis)
     return ai_block + f"\n\n---\n{_MY_NOTES_MARKER}\n\n*(none)*\n\n---\n"
 
 
@@ -621,7 +702,7 @@ def _extract_stored(content: str, granola_id: str) -> Optional[str]:
 
 
 def sync_class_entry(class_name: str, doc: dict, ai_md: str,
-                     context: dict, today: date) -> str:
+                     context: dict, today: date, analysis: str = "") -> str:
     """
     Smart sync for class files. Returns: 'new' | 'updated' | 'skipped' | 'missing'.
 
@@ -642,7 +723,7 @@ def sync_class_entry(class_name: str, doc: dict, ai_md: str,
 
     if stored is None:
         # Brand new entry
-        entry = build_entry(doc, ai_md, context, today)
+        entry = build_entry(doc, ai_md, context, today, analysis=analysis)
         with filepath.open("a") as f:
             f.write("\n" + entry)
         return "new"
@@ -651,7 +732,7 @@ def sync_class_entry(class_name: str, doc: dict, ai_md: str,
         return "skipped"
 
     # Granola notes have been updated — refresh AI block, preserve My Notes
-    new_ai_block = build_ai_block(doc, ai_md, context, today)
+    new_ai_block = build_ai_block(doc, ai_md, context, today, analysis=analysis)
 
     # Find the section: from the ## heading before granola_id to the end of the entry
     id_pos = content.find(f"<!-- granola_id: {granola_id}")
@@ -679,10 +760,14 @@ def sync_class_entry(class_name: str, doc: dict, ai_md: str,
 
 async def main():
     today         = date.today()
-    granola_token = get_granola_token()
-    canvas_token  = get_canvas_token()
+    granola_token  = get_granola_token()
+    canvas_token   = get_canvas_token()
+    anthropic_key  = get_anthropic_key()
 
-    print(f"[{datetime.now().strftime('%H:%M')}] Syncing Granola → Obsidian for {today}…")
+    if anthropic_key:
+        print(f"[{datetime.now().strftime('%H:%M')}] Syncing Granola → Obsidian for {today}… (enrichment ON)")
+    else:
+        print(f"[{datetime.now().strftime('%H:%M')}] Syncing Granola → Obsidian for {today}… (enrichment OFF — add ANTHROPIC_API_KEY to .env)")
 
     docs, folder_map = await asyncio.gather(
         fetch_todays_docs(granola_token, today),
@@ -702,12 +787,19 @@ async def main():
         class_name = match_class(title)
 
         ai_md, _   = await fetch_panel_content(granola_token, granola_id)
-        private_md = get_private_notes(doc)  # used for non-class meeting files only
+        private_md = get_private_notes(doc)
+
+        # ── Optional Claude enrichment (frameworks + takeaways + connections)
+        analysis = ""
+        if anthropic_key and ai_md:
+            course_label = class_name or title
+            analysis = await enrich_notes(ai_md, course_label, anthropic_key)
 
         if class_name:
             # ── Class meeting → append/update session in Classes/[ClassName].md
             context = await fetch_canvas_context(canvas_token, class_name, today)
-            result  = sync_class_entry(class_name, doc, ai_md, context, today)
+            result  = sync_class_entry(class_name, doc, ai_md, context, today,
+                                       analysis=analysis)
             if result in ("new", "updated"):
                 label = context.get("session_label", "")
                 suffix = f" ({'updated' if result == 'updated' else label or 'new'})"
@@ -716,7 +808,8 @@ async def main():
             # ── Non-class meeting → individual file in Meetings/[category]/
             granola_folder  = folder_map.get(granola_id, "")
             obsidian_folder = categorize_meeting(title, granola_folder)
-            wrote, path     = write_meeting_file(doc, ai_md, private_md, obsidian_folder, today)
+            wrote, path     = write_meeting_file(doc, ai_md, private_md, obsidian_folder,
+                                                 today, analysis=analysis)
             if wrote:
                 meeting_synced.append(f"{obsidian_folder}/{title}")
 
